@@ -1,0 +1,614 @@
+# observability-blueprint: Kubernetes Manifests
+# File: kubernetes/observability-stack.yaml
+# Production-ready K8s configuration with best practices
+
+---
+# NAMESPACE
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+
+---
+# RBAC: Service Account for Prometheus (with IAM role)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: observability
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/prometheus-role"
+
+---
+# RBAC: ClusterRole for Prometheus
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+
+---
+# RBAC: ClusterRoleBinding for Prometheus
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: observability
+
+---
+# ConfigMap: Prometheus Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: "observability-blueprint"
+        environment: "prod"
+
+    # Alertmanager configuration
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager:9093
+
+    # Alert rules
+    rule_files:
+      - '/etc/prometheus/rules/*.yaml'
+
+    scrape_configs:
+      # Self-monitoring
+      - job_name: 'prometheus'
+        scrape_interval: 5s
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # Kubernetes API server
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: default;kubernetes;https
+
+      # Kubelet metrics
+      - job_name: 'kubernetes-nodes'
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+
+      # Pod metrics
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: 'true'
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+---
+# Secret: Prometheus Config (encrypted)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prometheus-secret
+  namespace: observability
+type: Opaque
+stringData:
+  # Store sensitive config like external push URLs
+  remote_write_url: "https://your-remote-storage-endpoint"
+
+---
+# ConfigMap: Alert Rules
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: observability
+data:
+  fintech-alerts.yaml: |
+    groups:
+      - name: critical_path_alerts
+        interval: 30s
+        rules:
+          - alert: HighSettlementLatency
+            expr: |
+              histogram_quantile(0.99,
+                rate(settlement_processing_duration_seconds_bucket[5m])
+              ) > 5
+            for: 1m
+            labels:
+              severity: critical
+              component: settlement
+            annotations:
+              summary: "Settlement latency high: {{ $value }}s"
+              runbook: "docs/RUNBOOK_HIGH_SETTLEMENT_LATENCY.md"
+
+---
+# PersistentVolumeClaim: Prometheus Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-storage
+  namespace: observability
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3  # AWS EBS gp3 (cheaper than gp2)
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# StatefulSet: Prometheus
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  serviceName: prometheus
+  replicas: 3  # HA configuration
+  selector:
+    matchLabels:
+      app: prometheus
+      component: server
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        component: server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus
+      
+      # Pod Disruption Budget (maintain uptime during node drains)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - prometheus
+                topologyKey: kubernetes.io/hostname
+
+      # Security context
+      securityContext:
+        fsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        imagePullPolicy: IfNotPresent
+
+        # Resource limits (prevent starvation)
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+        # Ports
+        ports:
+        - containerPort: 9090
+          name: web
+          protocol: TCP
+
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 1
+
+        # Volume mounts
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+          readOnly: true
+        - name: rules
+          mountPath: /etc/prometheus/rules
+          readOnly: true
+        - name: storage
+          mountPath: /prometheus
+        - name: tmp
+          mountPath: /tmp
+
+        # Arguments
+        args:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus'
+          - '--storage.tsdb.retention.time=15d'
+          - '--storage.tsdb.retention.size=50GB'
+          - '--web.enable-lifecycle'
+          - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+          - '--web.console.templates=/usr/share/prometheus/consoles'
+
+      # Volumes
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: rules
+        configMap:
+          name: prometheus-rules
+      - name: tmp
+        emptyDir: {}
+
+  # Persistent volume claim template (for StatefulSet)
+  volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: gp3
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Service: Prometheus
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app: prometheus
+spec:
+  ports:
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: web
+  selector:
+    app: prometheus
+  type: ClusterIP
+
+---
+# Service: Prometheus Headless (for StatefulSet DNS)
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-headless
+  namespace: observability
+spec:
+  clusterIP: None
+  ports:
+  - port: 9090
+    targetPort: 9090
+  selector:
+    app: prometheus
+
+---
+# PodDisruptionBudget: Prometheus HA
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: prometheus
+
+---
+# NetworkPolicy: Prometheus (zero-trust)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  podSelector:
+    matchLabels:
+      app: prometheus
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow from Grafana
+  - from:
+    - podSelector:
+        matchLabels:
+          app: grafana
+    ports:
+    - protocol: TCP
+      port: 9090
+  # Allow from Alertmanager
+  - from:
+    - podSelector:
+        matchLabels:
+          app: alertmanager
+    ports:
+    - protocol: TCP
+      port: 9090
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow K8s API
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow scraping pods
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 9090
+
+---
+# ConfigMap: Grafana Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: observability
+data:
+  settlement-health.json: |
+    {
+      "dashboard": {
+        "title": "Settlement Health",
+        "panels": [
+          {
+            "title": "P99 Settlement Latency",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, rate(settlement_processing_duration_seconds_bucket[5m]))"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Deployment: Grafana
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  replicas: 3  # HA
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      serviceAccountName: grafana
+      
+      securityContext:
+        fsGroup: 472
+        runAsNonRoot: true
+        runAsUser: 472
+
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.0.0
+        
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+        ports:
+        - containerPort: 3000
+          name: web
+
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: "admin"
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin
+              key: password
+        - name: GF_INSTALL_PLUGINS
+          value: "grafana-piechart-panel"
+
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /api/health/db
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+        volumeMounts:
+        - name: storage
+          mountPath: /var/lib/grafana
+        - name: dashboards
+          mountPath: /etc/grafana/provisioning/dashboards
+
+      volumes:
+      - name: storage
+        emptyDir: {}
+      - name: dashboards
+        configMap:
+          name: grafana-dashboards
+
+---
+# Service: Grafana
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+  selector:
+    app: grafana
+  type: LoadBalancer
+
+---
+# ServiceAccount: Grafana
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grafana
+  namespace: observability
+
+---
+# Alertmanager ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: observability
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      # Default receiver
+      receiver: 'null'
+      routes:
+      # Critical alerts → PagerDuty (immediate)
+      - match:
+          severity: critical
+        receiver: 'pagerduty'
+        continue: true
+      # Warnings → Slack
+      - match:
+          severity: warning
+        receiver: 'slack'
+      # Info → Email digest
+      - match:
+          severity: info
+        receiver: 'email'
+        group_wait: 1h
+        group_interval: 1h
+
+    receivers:
+    - name: 'null'
+
+    - name: 'pagerduty'
+      pagerduty_configs:
+      - service_key: ${PAGERDUTY_KEY}
+        description: '{{ .GroupLabels.alertname }}'
+
+    - name: 'slack'
+      slack_configs:
+      - api_url: ${SLACK_WEBHOOK_URL}
+        channel: '#alerts'
+        title: 'Prometheus Alert'
+
+    - name: 'email'
+      email_configs:
+      - to: 'alerts@company.com'
+        from: 'alerting@company.com'
+
+    inhibit_rules:
+    # Don't send warning if critical exists
+    - source_match:
+        severity: 'critical'
+      target_match:
+        severity: 'warning'
+      equal: ['alertname', 'service']

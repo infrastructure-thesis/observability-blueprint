@@ -1,0 +1,393 @@
+# observability-blueprint: Prometheus Alert Rules
+# File: alerts/fintech-alerts.yaml
+# These are battle-tested alerts for fintech environments
+# All rules include business context + action items
+
+groups:
+  # ─────────────────────────────────────────────────────────
+  # CRITICAL PATH ALERTS (Page on-call immediately)
+  # ─────────────────────────────────────────────────────────
+  - name: critical_path_alerts
+    interval: 30s
+    rules:
+      - alert: HighSettlementLatency
+        expr: |
+          histogram_quantile(0.99,
+            rate(settlement_processing_duration_seconds_bucket[5m])
+          ) > 5
+        for: 1m
+        labels:
+          severity: critical
+          component: settlement
+          pagerduty_group: trading_ops
+        annotations:
+          summary: "Settlement latency high: {{ $value }}s (threshold: 5s)"
+          description: "P99 settlement latency exceeds 5 seconds. This impacts customer fund availability."
+          business_impact: "~$10,000/minute in stuck transactions"
+          runbook: "https://github.com/yourusername/observability-blueprint/blob/main/docs/RUNBOOK_HIGH_SETTLEMENT_LATENCY.md"
+          action: |
+            1. Check database query times: SELECT NOW() - query_start FROM slow_queries LIMIT 5;
+            2. Check payment gateway status (Stripe, Wise, Square APIs)
+            3. Verify no network issues (AWS VPC flow logs)
+            4. If >15 min: trigger incident response, notify customers
+
+      - alert: PaymentProcessingFailure
+        expr: |
+          rate(payment_processing_errors_total[5m]) / 
+          rate(payment_processing_total[5m]) > 0.001
+        for: 2m
+        labels:
+          severity: critical
+          component: payment_processor
+          pagerduty_group: platform_team
+        annotations:
+          summary: "Payment error rate {{ $value | humanizePercentage }} (threshold: 0.1%)"
+          description: "More than 0.1% of payment transactions failing"
+          business_impact: "{{ $value | multiply 1000000 | humanize }} failed transactions/day = ${{ $value | multiply 10000 }}k revenue impact"
+          runbook: "docs/RUNBOOK_PAYMENT_FAILURE.md"
+
+      - alert: CriticalDatabaseSlowQuery
+        expr: |
+          rate(database_query_duration_seconds_bucket{le="+Inf"}[5m]) > 10
+        for: 3m
+        labels:
+          severity: critical
+          component: database
+          pagerduty_group: database_team
+        annotations:
+          summary: "Database queries >10s detected"
+          description: "{{ $value }} queries taking >10 seconds (possible deadlock, missing index, or full table scan)"
+          action: |
+            1. Run: EXPLAIN ANALYZE for slow query
+            2. Check active connections: SELECT count(*) FROM pg_stat_activity;
+            3. Look for missing indices or N+1 queries
+          runbook: "docs/RUNBOOK_DATABASE_SLOWQUERY.md"
+
+      - alert: OutOfMemory
+        expr: |
+          container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.95
+        for: 1m
+        labels:
+          severity: critical
+          component: kubernetes
+        annotations:
+          summary: "Pod {{ $labels.pod_name }} approaching OOM ({{ $value | humanizePercentage }})"
+          description: "Memory usage at {{ $value | humanizePercentage }} of limit. Pod will be killed if exceeds 100%."
+          action: |
+            1. Increase memory request: kubectl set resources pod {{ $labels.pod_name }} --limits=memory=8Gi
+            2. Check memory leak: kubectl top pods -n {{ $labels.namespace }}
+            3. Scale horizontally if consistent high usage
+          runbook: "docs/RUNBOOK_OOM.md"
+
+  # ─────────────────────────────────────────────────────────
+  # COMPLIANCE & SECURITY ALERTS (Page compliance officer)
+  # ─────────────────────────────────────────────────────────
+  - name: compliance_security_alerts
+    interval: 30s
+    rules:
+      - alert: UnencryptedDataDetected
+        expr: |
+          increase(unencrypted_data_scan_findings[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: security
+          pagerduty_group: compliance_officer
+        annotations:
+          summary: "Unencrypted data detected in logs"
+          description: "Scan found {{ $value }} instances of unencrypted sensitive data (emails, SSNs, card numbers)"
+          regulatory_impact: "GDPR violation, FCA breach, potential fine"
+          action: |
+            1. Immediately rotate affected credentials
+            2. Notify security team: /security-incident
+            3. Log incident: compliance/incident-{{ now | date 'YYYY-MM-DD' }}.json
+            4. Assess customer impact
+          runbook: "docs/RUNBOOK_UNENCRYPTED_DATA.md"
+
+      - alert: SecretExposedInLogs
+        expr: |
+          increase(secret_exposure_detected_total[5m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+          component: security
+          pagerduty_group: compliance_officer
+        annotations:
+          summary: "Secret exposed in logs: {{ $labels.secret_type }}"
+          description: "{{ $labels.secret_name }} detected in logs at {{ $labels.timestamp }}"
+          action: |
+            1. IMMEDIATE: Rotate {{ $labels.secret_name }}
+            2. Check log exports (Cloudtrail, S3, Splunk)
+            3. File security incident
+            4. Notify affected customers if personal data exposed
+          runbook: "docs/RUNBOOK_SECRET_EXPOSED.md"
+
+      - alert: UnauthorizedAPIAccess
+        expr: |
+          rate(unauthorized_api_access_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          component: api
+          pagerduty_group: security_team
+        annotations:
+          summary: "{{ $value }} unauthorized API access attempts (threshold: 5/min)"
+          description: "Potential brute force or unauthorized access attempt from {{ $labels.source_ip }}"
+          action: |
+            1. Block IP if malicious: aws ec2 authorize-security-group-ingress --ip BLOCK
+            2. Check user account: SELECT * FROM user_audit_log WHERE user_id='{{ $labels.user_id }}'
+            3. Review failed login patterns
+          runbook: "docs/RUNBOOK_UNAUTHORIZED_ACCESS.md"
+
+      - alert: ComplianceDriftDetected
+        expr: |
+          increase(compliance_control_failed_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: compliance
+          pagerduty_group: compliance_officer
+        annotations:
+          summary: "Compliance control failed: {{ $labels.control_name }}"
+          description: |
+            FCA/SOX control '{{ $labels.control_name }}' failed:
+            - Expected: {{ $labels.expected_state }}
+            - Actual: {{ $labels.actual_state }}
+          regulatory_impact: "FCA audit finding, potential enforcement action"
+          action: |
+            1. Investigate control failure immediately
+            2. Document remediation plan
+            3. Verify fix deployed
+            4. Log in compliance audit trail
+          runbook: "docs/RUNBOOK_COMPLIANCE_DRIFT.md"
+
+  # ─────────────────────────────────────────────────────────
+  # OPERATIONAL ALERTS (Slack warning, batch digest)
+  # ─────────────────────────────────────────────────────────
+  - name: operational_alerts
+    interval: 60s
+    rules:
+      - alert: CostAnomalyDetected
+        expr: |
+          abs(rate(aws_billing_estimated_charges[1h]) - avg_over_time(rate(aws_billing_estimated_charges[1h])[7d])) 
+          > avg_over_time(rate(aws_billing_estimated_charges[1h])[7d]) * 0.15
+        for: 5m
+        labels:
+          severity: warning
+          component: cost
+          slack_channel: "#finance"
+        annotations:
+          summary: "Cost spike detected: +{{ $value | humanize }}%"
+          description: "Daily cost increased by {{ $value | humanize }}% vs 7-day average"
+          financial_impact: "+${{ $value | multiply 500 | humanize }}/day impact"
+          action: |
+            1. Check resource scaling: kubectl top nodes
+            2. Verify reserved instances active: aws ec2 describe-reserved-instances
+            3. Review cost breakdown by service: infracost breakdown
+            4. Investigate source of spike (new deployment, increased traffic, etc.)
+          runbook: "docs/RUNBOOK_COST_ANOMALY.md"
+
+      - alert: HighErrorRate
+        expr: |
+          rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+          slack_channel: "#alerts"
+        annotations:
+          summary: "Error rate high: {{ $value | humanizePercentage }} (threshold: 1%)"
+          description: "API error rate increased to {{ $value | humanizePercentage }} for service {{ $labels.service }}"
+          action: |
+            1. Check error types: SELECT status, count(*) FROM api_logs GROUP BY status;
+            2. Review recent deployments: git log --oneline -10
+            3. Check downstream dependencies (databases, external APIs)
+            4. Increase monitoring verbosity if needed
+          runbook: "docs/RUNBOOK_HIGH_ERROR_RATE.md"
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+          slack_channel: "#performance"
+        annotations:
+          summary: "P95 latency high: {{ $value }}s (threshold: 2s)"
+          description: "API latency degradation detected for {{ $labels.service }}"
+          user_impact: "1 in 20 users experiencing slow requests"
+          action: |
+            1. Identify slow endpoints: SELECT endpoint, avg(duration) FROM api_logs GROUP BY endpoint;
+            2. Check CPU/memory: kubectl top pods -n {{ $labels.namespace }}
+            3. Review database query times
+            4. Scale if under high load
+          runbook: "docs/RUNBOOK_HIGH_LATENCY.md"
+
+      - alert: PodUnscheduled
+        expr: |
+          increase(pod_unscheduled_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: kubernetes
+          slack_channel: "#platform"
+        annotations:
+          summary: "Pod unscheduled for {{ $value | humanizeDuration }}: {{ $labels.pod_name }}"
+          description: "Pod pending >10 min, likely resource shortage"
+          action: |
+            1. Check cluster resources: kubectl top nodes
+            2. Check pod resource requests: kubectl describe pod {{ $labels.pod_name }}
+            3. Check node availability: kubectl get nodes
+            4. Scale cluster if under capacity: terraform apply -var="replica_count=4"
+          runbook: "docs/RUNBOOK_POD_UNSCHEDULED.md"
+
+      - alert: PersistentVolumeLow
+        expr: |
+          kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+          slack_channel: "#platform"
+        annotations:
+          summary: "PVC {{ $labels.persistentvolumeclaim }} at {{ $value | humanizePercentage }} capacity"
+          description: "Storage filling up. {{ $value | humanizePercentage }} of {{ $labels.persistentvolumeclaim }} used"
+          action: |
+            1. Increase PVC size: kubectl patch pvc {{ $labels.persistentvolumeclaim }} -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+            2. Cleanup old data: DELETE FROM logs WHERE timestamp < NOW() - INTERVAL 30 DAYS;
+            3. Monitor growth rate
+          runbook: "docs/RUNBOOK_STORAGE_LOW.md"
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: |
+          pg_stat_activity_count / max_connections > 0.8
+        for: 2m
+        labels:
+          severity: warning
+          component: database
+          slack_channel: "#database"
+        annotations:
+          summary: "Database connections {{ $value | humanizePercentage }} of max"
+          description: "{{ $value | humanizePercentage }} of {{ $labels.max_connections }} connections in use"
+          action: |
+            1. Check active queries: SELECT pid, query FROM pg_stat_activity WHERE state='active';
+            2. Kill idle connections: SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle' AND query_start < NOW() - INTERVAL 15 MINUTES;
+            3. Increase max_connections or scale read replicas
+          runbook: "docs/RUNBOOK_DB_CONNECTION_POOL.md"
+
+  # ─────────────────────────────────────────────────────────
+  # INFRASTRUCTURE HEALTH (Digest daily, non-urgent)
+  # ─────────────────────────────────────────────────────────
+  - name: infrastructure_health
+    interval: 60s
+    rules:
+      - alert: HighCPUUsage
+        expr: |
+          (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 80
+        for: 10m
+        labels:
+          severity: info
+          component: compute
+          slack_channel: "#daily-digest"
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}: {{ $value }}%"
+          description: "Node {{ $labels.instance }} CPU at {{ $value }}% for >10 min"
+          action: "Non-urgent. Review workload distribution, consider scaling."
+          runbook: "docs/RUNBOOK_HIGH_CPU.md"
+
+      - alert: DisruptionBudgetViolation
+        expr: |
+          increase(pdb_disruptions_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: info
+          component: kubernetes
+          slack_channel: "#daily-digest"
+        annotations:
+          summary: "Pod Disruption Budget violated for {{ $labels.deployment }}"
+          description: "More pods evicted than PDB allows. This may indicate cluster scaling issues."
+          action: "Review PDB configuration and cluster scaling needs"
+          runbook: "docs/RUNBOOK_PDB_VIOLATION.md"
+
+      - alert: NodeMemoryPressure
+        expr: |
+          kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+        for: 5m
+        labels:
+          severity: info
+          component: kubernetes
+          slack_channel: "#daily-digest"
+        annotations:
+          summary: "Node {{ $labels.node }} experiencing memory pressure"
+          description: "Kubelet on node {{ $labels.node }} reports memory pressure. Pods may be evicted."
+          action: "Monitor closely, may need to scale cluster or reduce workload"
+
+      - alert: PrometheusTargetDown
+        expr: |
+          up{job!="prometheus"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: observability
+          slack_channel: "#observability"
+        annotations:
+          summary: "Prometheus scrape target down: {{ $labels.job }}"
+          description: "Target {{ $labels.instance }} ({{ $labels.job }}) has been down for >5 min"
+          action: |
+            1. Check target health: curl http://{{ $labels.instance }}:{{ $labels.port }}/health
+            2. Check firewall rules
+            3. Verify service is running
+          runbook: "docs/RUNBOOK_PROMETHEUS_TARGET_DOWN.md"
+
+  # ─────────────────────────────────────────────────────────
+  # RECORDING RULES (Pre-computed for dashboard performance)
+  # ─────────────────────────────────────────────────────────
+  - name: recording_rules
+    interval: 30s
+    rules:
+      # API performance aggregations
+      - record: "api:request_latency:p95"
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (service, le)
+          )
+
+      - record: "api:request_latency:p99"
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (service, le)
+          )
+
+      - record: "api:error_rate"
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          /
+          sum(rate(http_requests_total[5m])) by (service)
+
+      # Settlement performance
+      - record: "settlement:latency:p99"
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(settlement_processing_duration_seconds_bucket[5m])) by (processor, le)
+          )
+
+      - record: "settlement:success_rate:1m"
+        expr: |
+          sum(rate(settlement_processed_total[1m])) by (processor)
+          /
+          sum(rate(settlement_attempts_total[1m])) by (processor)
+
+      # Cost metrics (for finance dashboards)
+      - record: "cost:per_transaction"
+        expr: |
+          (aws_billing_estimated_charges / sum(rate(transactions_total[1h])))
+
+      - record: "cost:hourly"
+        expr: |
+          aws_billing_estimated_charges / 24
+
+      # Compliance metrics
+      - record: "compliance:control_status"
+        expr: |
+          (compliance_control_passed_total / (compliance_control_passed_total + compliance_control_failed_total))
