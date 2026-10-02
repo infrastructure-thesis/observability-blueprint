@@ -1,0 +1,59 @@
+observability-blueprint: System Design Sketch (Week 1, Day 1)
+
+COMPONENTS & DATA FLOW:
+├── Input Layer
+│   ├── Applications (50+ microservices)
+│   │   └── Expose /metrics (Prometheus format)
+│   │   └── Send structured logs (JSON to stdout)
+│   └── Infrastructure (K8s, RDS, S3)
+│       └── Kubelet, RDS CloudWatch, etc.
+│
+├── Collection Layer
+│   ├── Prometheus (pull-based)
+│   │   └── Scrape targets every 15 seconds
+│   │   └── Store time-series on SSD
+│   │   └── Evaluate alert rules
+│   └── Fluent-bit (push-based)
+│       └── Parse JSON logs
+│       └── Ship to Loki
+│
+├── Storage Layer
+│   ├── Prometheus (hot: 15 days SSD, cold: S3)
+│   ├── Loki (hot: 30 days S3, cold: Glacier)
+│   ├── Tempo (hot: 24 hours, cold: none)
+│   └── Grafana DB (PostgreSQL RDS)
+│
+├── Query Layer
+│   ├── Grafana
+│   │   ├── Dashboard: Settlement Health
+│   │   ├── Dashboard: Compliance Drift
+│   │   └── Dashboard: Cost Intelligence
+│   └── Grafana Explorer (ad-hoc queries)
+│
+└── Action Layer
+    ├── Alerts fire (Prometheus)
+    ├── Route (Alertmanager)
+    ├── Notify
+    │   ├── PagerDuty (critical)
+    │   ├── Slack (warning)
+    │   └── Email (info digest)
+    └── On-call (responds in <5 min)
+
+DEPLOYMENT:
+- Kubernetes (EKS on AWS)
+- 3 replicas for each component (HA)
+- Network policies (zero-trust)
+- Encrypted at rest (KMS) + in transit (TLS 1.3)
+
+COMPLIANCE:
+- FCA: Audit trail in Loki (immutable S3)
+- SOX: Change control via git + GitHub Actions
+- GDPR: EU data residency (eu-west-1 only)
+
+COST:
+- Prometheus: $150/mo
+- Grafana: $300/mo
+- Loki: $200/mo
+- Tempo: $250/mo
+- Infrastructure: $100/mo
+- TOTAL: $900/mo (vs Datadog $2,500/mo)
